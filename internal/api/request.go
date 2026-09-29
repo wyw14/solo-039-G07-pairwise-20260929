@@ -22,6 +22,21 @@ type leaseRequest struct {
 	Owner  string  `json:"owner"`
 	Amount float64 `json:"amount"`
 }
+type inspectionRequest struct {
+	Valve          string  `json:"valve"`
+	TestPressure   float64 `json:"test_pressure"`
+	OpenMS         int64   `json:"open_ms"`
+	CloseMS        int64   `json:"close_ms"`
+	ReseatResult   bool    `json:"reseat_result"`
+	ReseatPressure float64 `json:"reseat_pressure"`
+	MaxResponseMS  int64   `json:"max_response_ms"`
+	ValidityHours  int64   `json:"validity_hours"`
+}
+type dispositionRequest struct {
+	Valve    string `json:"valve"`
+	Measure  string `json:"measure"`
+	Operator string `json:"operator"`
+}
 
 func decodeJSON(r *http.Request, value any) error {
 	decoder := json.NewDecoder(r.Body)

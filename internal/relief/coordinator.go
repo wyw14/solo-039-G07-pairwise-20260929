@@ -13,6 +13,7 @@ type ShutdownResult struct {
 	SteamError    error
 	Depressurized bool
 	SteamClosed   bool
+	Plan          Plan
 }
 
 func NewCoordinator() *Coordinator { return &Coordinator{State: New()} }
@@ -29,8 +30,8 @@ func (c *Coordinator) Shutdown(ctx context.Context, cpg model.Campaign, valve st
 
 func (c *Coordinator) Safe() bool { return c.State.Snapshot().Released && !c.State.Snapshot().TimedOut }
 
-func CombineShutdown(reliefErr, steamErr error, reliefState model.Relief, steamClosed bool) ShutdownResult {
-	return ShutdownResult{ReliefError: reliefErr, SteamError: steamErr, Depressurized: reliefErr == nil && reliefState.Released && !reliefState.TimedOut, SteamClosed: steamErr == nil && steamClosed}
+func CombineShutdown(reliefErr, steamErr error, reliefState model.Relief, steamClosed bool, plan Plan) ShutdownResult {
+	return ShutdownResult{ReliefError: reliefErr, SteamError: steamErr, Depressurized: reliefErr == nil && reliefState.Released && !reliefState.TimedOut, SteamClosed: steamErr == nil && steamClosed, Plan: plan}
 }
 
 func (r ShutdownResult) Error() error {

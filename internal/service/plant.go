@@ -18,6 +18,7 @@ import (
 	"github.com/wyw14/solo-039/internal/relief"
 	"github.com/wyw14/solo-039/internal/utility"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -51,6 +52,7 @@ type Plant struct {
 	ReboilerCommands  *reboiler.CommandBook
 	Evidence          *analyzer.EvidenceCatalog
 	ReliefHistory     *relief.History
+	ReliefInspections *relief.InspectionBook
 	Incidents         *Incidents
 	started           bool
 	lastError         string
@@ -89,6 +91,7 @@ func NewPlant(dataDir string) *Plant {
 		ReboilerCommands:  reboiler.NewCommandBook(),
 		Evidence:          analyzer.NewEvidenceCatalog(),
 		ReliefHistory:     relief.NewHistory(),
+		ReliefInspections: relief.NewInspectionBook(),
 		Incidents:         NewIncidents(),
 	}
 	plant.Reflux.Register("T-101", plant.RefluxState)
@@ -224,12 +227,40 @@ func (p *Plant) AcquireReflux(owner string, amount float64) (model.Lease, error)
 	return lease, nil
 }
 
-func (p *Plant) Shutdown(ctx context.Context, reliefTimeout bool) (relief.ShutdownResult, error) {
+// AlternativeDisposition 是证书不可用时随停机请求登记的替代处置措施（如手动隔离+旁站）。
+type AlternativeDisposition struct {
+	Measure  string
+	Operator string
+}
+
+func (p *Plant) Shutdown(ctx context.Context, reliefTimeout bool, alternative AlternativeDisposition) (relief.ShutdownResult, error) {
+	valve := "flare"
+	now := time.Now()
+	plan := p.ReliefInspections.Plan(valve, now)
+	if strings.TrimSpace(alternative.Measure) != "" {
+		disposition, err := p.ReliefInspections.RecordDisposition(valve, alternative.Measure, alternative.Operator, now)
+		if err != nil {
+			return relief.ShutdownResult{}, err
+		}
+		plan = plan.WithDisposition(disposition)
+	}
+	if plan.Blocked() {
+		err := errors.New("relief valve unavailable for shutdown plan: " + plan.Reason)
+		p.Incidents.Open("relief-certificate", err.Error(), p.Campaign.Snapshot().Revision.String())
+		p.fail(err)
+		return relief.ShutdownResult{Plan: plan}, err
+	}
+	if plan.ByDisposition() {
+		if err := p.record("relief.disposition", plan.Alternative.Measure); err != nil {
+			p.fail(err)
+			return relief.ShutdownResult{Plan: plan}, err
+		}
+	}
 	current := p.Campaign.Advance(model.Shutting)
-	reliefErr := p.Relief.Shutdown(ctx, current, "flare", reliefTimeout)
+	reliefErr := p.Relief.Shutdown(ctx, current, valve, reliefTimeout)
 	steamErr := p.ReboilerCommands.Close(ctx, p.Reboiler, current)
 	p.ReboilerTelemetry.Record(p.Reboiler.Snapshot())
-	result := relief.CombineShutdown(reliefErr, steamErr, p.Relief.State.Snapshot(), p.Reboiler.ClosureConfirmed(current.Epoch))
+	result := relief.CombineShutdown(reliefErr, steamErr, p.Relief.State.Snapshot(), p.Reboiler.ClosureConfirmed(current.Epoch), plan)
 	p.ReliefHistory.Record(p.Relief.State.Snapshot(), reliefErr)
 	if err := result.Error(); err != nil {
 		p.Incidents.Open("shutdown", err.Error(), current.Revision.String())
@@ -241,6 +272,38 @@ func (p *Plant) Shutdown(ctx context.Context, reliefTimeout bool) (relief.Shutdo
 	p.started = false
 	p.mu.Unlock()
 	return result, p.record("plant.stopped", "safe")
+}
+
+// RecordReliefInspection 录入泄压阀投用前定检，合格则签发带有效期的投用证书。
+func (p *Plant) RecordReliefInspection(input relief.InspectionInput) (relief.Inspection, relief.Certificate, error) {
+	inspection, certificate, err := p.ReliefInspections.Record(input, time.Now())
+	if err != nil {
+		return relief.Inspection{}, relief.Certificate{}, err
+	}
+	payload := fmt.Sprintf("%s:%.3f:%t", inspection.Valve, inspection.TestPressure, inspection.Passed)
+	if err := p.record("relief.inspection", payload); err != nil {
+		p.fail(err)
+		return relief.Inspection{}, relief.Certificate{}, err
+	}
+	return inspection, certificate, nil
+}
+
+// RecordReliefDisposition 登记证书不可用时的替代处置措施。
+func (p *Plant) RecordReliefDisposition(valve, measure, operator string) (relief.Disposition, error) {
+	disposition, err := p.ReliefInspections.RecordDisposition(valve, measure, operator, time.Now())
+	if err != nil {
+		return relief.Disposition{}, err
+	}
+	if err := p.record("relief.disposition", disposition.Measure); err != nil {
+		p.fail(err)
+		return relief.Disposition{}, err
+	}
+	return disposition, nil
+}
+
+// ReliefPlan 返回指定泄压阀当前的定检证书可用性评估。
+func (p *Plant) ReliefPlan(valve string) relief.Plan {
+	return p.ReliefInspections.Plan(valve, time.Now())
 }
 
 func (p *Plant) Snapshot() model.Snapshot {
@@ -284,7 +347,19 @@ func (p *Plant) Status() map[string]any {
 	lastError := p.lastError
 	p.mu.RUnlock()
 	gradient, _ := p.Profile.Gradient()
-	return map[string]any{"started": started, "last_error": lastError, "campaign": p.Campaign.Snapshot(), "column": p.Column.Snapshot(), "reflux_used": p.Reflux.Used(), "products": p.ProductTargets(), "relief": p.Relief.State.Snapshot(), "feed_metrics": p.FeedMetrics.Snapshot(), "reflux_telemetry": p.RefluxTelemetry.Snapshot(), "reboiler_telemetry": p.ReboilerTelemetry.Snapshot(), "product_decisions": p.ProductAudit.Count(), "utility_used": p.UtilityLedger.Used(), "metrics": p.Metrics.Snapshot(), "campaign_changes": p.CampaignHistory.Count(), "profile_gradient": gradient, "profile_stable": p.Profile.Stable(40), "evidence_count": p.Evidence.Count(p.Campaign.Snapshot().Revision.String()), "relief_attempts": p.ReliefHistory.Count(), "open_incidents": p.Incidents.CountOpen(), "operational_audit": p.OperationalAudit()}
+	reliefPlan := p.ReliefInspections.Plan(p.Relief.State.Snapshot().Valve, time.Now())
+	return map[string]any{"started": started, "last_error": lastError, "campaign": p.Campaign.Snapshot(), "column": p.Column.Snapshot(), "reflux_used": p.Reflux.Used(), "products": p.ProductTargets(), "relief": p.Relief.State.Snapshot(), "relief_certificate": reliefCertificateStatus(reliefPlan), "feed_metrics": p.FeedMetrics.Snapshot(), "reflux_telemetry": p.RefluxTelemetry.Snapshot(), "reboiler_telemetry": p.ReboilerTelemetry.Snapshot(), "product_decisions": p.ProductAudit.Count(), "utility_used": p.UtilityLedger.Used(), "metrics": p.Metrics.Snapshot(), "campaign_changes": p.CampaignHistory.Count(), "profile_gradient": gradient, "profile_stable": p.Profile.Stable(40), "evidence_count": p.Evidence.Count(p.Campaign.Snapshot().Revision.String()), "relief_attempts": p.ReliefHistory.Count(), "open_incidents": p.Incidents.CountOpen(), "operational_audit": p.OperationalAudit()}
+}
+
+func reliefCertificateStatus(plan relief.Plan) map[string]any {
+	status := map[string]any{"valve": plan.Valve, "available": plan.Available, "has_certificate": plan.HasCertificate, "blocked": plan.Blocked(), "reason": plan.Reason}
+	if plan.HasCertificate {
+		status["certificate"] = plan.Certificate
+	}
+	if plan.Alternative != nil {
+		status["alternative"] = plan.Alternative
+	}
+	return status
 }
 
 func (p *Plant) record(kind, payload string) error {

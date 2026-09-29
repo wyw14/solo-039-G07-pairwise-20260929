@@ -3,6 +3,8 @@ package api
 import (
 	"net/http"
 	"time"
+
+	"github.com/wyw14/solo-039/internal/service"
 )
 
 func (s *Server) transition(w http.ResponseWriter, r *http.Request) {
@@ -74,7 +76,11 @@ func (s *Server) shutdown(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
-	result, err := s.plant.Shutdown(r.Context(), timeout)
+	alternative := service.AlternativeDisposition{
+		Measure:  r.URL.Query().Get("alternative"),
+		Operator: r.URL.Query().Get("operator"),
+	}
+	result, err := s.plant.Shutdown(r.Context(), timeout, alternative)
 	if err != nil {
 		writeJSON(w, http.StatusConflict, map[string]any{"error": err.Error(), "result": result})
 		return
