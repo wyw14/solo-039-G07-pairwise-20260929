@@ -18,6 +18,7 @@ import (
 	"github.com/wyw14/solo-039/internal/relief"
 	"github.com/wyw14/solo-039/internal/utility"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -226,11 +227,30 @@ func (p *Plant) AcquireReflux(owner string, amount float64) (model.Lease, error)
 
 func (p *Plant) Shutdown(ctx context.Context, reliefTimeout bool) (relief.ShutdownResult, error) {
 	current := p.Campaign.Advance(model.Shutting)
-	reliefErr := p.Relief.Shutdown(ctx, current, "flare", reliefTimeout)
+	valve := "flare"
+	now := time.Now()
+	// 投用前定检依据是安全停机计划的前置条件：无有效证书且无有效替代处置时，
+	// 安全停机计划提示阀门不可用，不得执行泄压动作。
+	availability := p.Relief.PlanShutdown(valve, now)
+	if !availability.Available && !availability.DispoPresent {
+		err := fmt.Errorf("relief valve %s unavailable: %s", valve, availability.Reason)
+		result := relief.CombineShutdown(err, nil, p.Relief.State.Snapshot(), false, availability)
+		p.Incidents.Open("shutdown", err.Error(), current.Revision.String())
+		p.fail(err)
+		return result, err
+	}
+	reliefErr := p.Relief.Shutdown(ctx, current, valve, reliefTimeout)
 	steamErr := p.ReboilerCommands.Close(ctx, p.Reboiler, current)
 	p.ReboilerTelemetry.Record(p.Reboiler.Snapshot())
-	result := relief.CombineShutdown(reliefErr, steamErr, p.Relief.State.Snapshot(), p.Reboiler.ClosureConfirmed(current.Epoch))
+	result := relief.CombineShutdown(reliefErr, steamErr, p.Relief.State.Snapshot(), p.Reboiler.ClosureConfirmed(current.Epoch), availability)
 	p.ReliefHistory.Record(p.Relief.State.Snapshot(), reliefErr)
+	if !availability.Available && availability.DispoPresent {
+		// 持有效替代处置降级执行：保留处置依据，供事后追溯，不视为持证投用。
+		if err := p.record("relief.shutdown_under_disposition", fmt.Sprintf("%s|%s|%s", valve, availability.Reason, availability.Disposition.Action)); err != nil {
+			p.fail(err)
+			return result, err
+		}
+	}
 	if err := result.Error(); err != nil {
 		p.Incidents.Open("shutdown", err.Error(), current.Revision.String())
 		p.fail(err)
@@ -241,6 +261,46 @@ func (p *Plant) Shutdown(ctx context.Context, reliefTimeout bool) (relief.Shutdo
 	p.started = false
 	p.mu.Unlock()
 	return result, p.record("plant.stopped", "safe")
+}
+
+// RecordReliefInspection 录入泄压阀投用前定检结果：测试压力、启闭响应、回座
+// 结果。合格时签发带有效期的投用证书，失败时保留失败记录且不签发证书。
+func (p *Plant) RecordReliefInspection(in relief.Inspection) (relief.Inspection, relief.InspectionResult, relief.Certificate, error) {
+	in.Valve = strings.TrimSpace(in.Valve)
+	recorded, result, cert, err := p.Relief.Book.RecordInspection(in, time.Now())
+	if err != nil {
+		return relief.Inspection{}, relief.InspectionResult{}, relief.Certificate{}, err
+	}
+	payload := fmt.Sprintf("%s|passed=%t|%.3f|%s|%s", recorded.Valve, result.Passed(), recorded.TestPressure, recorded.Response, recorded.Reseat)
+	if recordErr := p.record("relief.inspection", payload); recordErr != nil {
+		p.fail(recordErr)
+		return recorded, result, cert, recordErr
+	}
+	if !result.Passed() {
+		p.Incidents.Open("relief-inspection", fmt.Sprintf("valve %s failed periodic inspection: %s", recorded.Valve, result.Message), p.Campaign.Snapshot().Revision.String())
+	}
+	return recorded, result, cert, nil
+}
+
+// RecordReliefDisposition 保留定检失败或证书过期时的替代处置记录。
+func (p *Plant) RecordReliefDisposition(d relief.Disposition) (relief.Disposition, error) {
+	if d.At.IsZero() {
+		d.At = time.Now()
+	}
+	recorded, err := p.Relief.Book.RecordDisposition(d)
+	if err != nil {
+		return relief.Disposition{}, err
+	}
+	if err := p.record("relief.disposition", fmt.Sprintf("%s|%s|%s", recorded.Valve, recorded.Reason, recorded.Action)); err != nil {
+		p.fail(err)
+		return recorded, err
+	}
+	return recorded, nil
+}
+
+// ReliefCertificate 返回指定泄压阀的投用证书核查情况。
+func (p *Plant) ReliefCertificate(valve string) relief.Availability {
+	return p.Relief.PlanShutdown(valve, time.Now())
 }
 
 func (p *Plant) Snapshot() model.Snapshot {
@@ -284,7 +344,8 @@ func (p *Plant) Status() map[string]any {
 	lastError := p.lastError
 	p.mu.RUnlock()
 	gradient, _ := p.Profile.Gradient()
-	return map[string]any{"started": started, "last_error": lastError, "campaign": p.Campaign.Snapshot(), "column": p.Column.Snapshot(), "reflux_used": p.Reflux.Used(), "products": p.ProductTargets(), "relief": p.Relief.State.Snapshot(), "feed_metrics": p.FeedMetrics.Snapshot(), "reflux_telemetry": p.RefluxTelemetry.Snapshot(), "reboiler_telemetry": p.ReboilerTelemetry.Snapshot(), "product_decisions": p.ProductAudit.Count(), "utility_used": p.UtilityLedger.Used(), "metrics": p.Metrics.Snapshot(), "campaign_changes": p.CampaignHistory.Count(), "profile_gradient": gradient, "profile_stable": p.Profile.Stable(40), "evidence_count": p.Evidence.Count(p.Campaign.Snapshot().Revision.String()), "relief_attempts": p.ReliefHistory.Count(), "open_incidents": p.Incidents.CountOpen(), "operational_audit": p.OperationalAudit()}
+	reliefValve := p.Relief.State.Snapshot().Valve
+	return map[string]any{"started": started, "last_error": lastError, "campaign": p.Campaign.Snapshot(), "column": p.Column.Snapshot(), "reflux_used": p.Reflux.Used(), "products": p.ProductTargets(), "relief": p.Relief.State.Snapshot(), "relief_certification": p.Relief.PlanShutdown(reliefValve, time.Now()), "feed_metrics": p.FeedMetrics.Snapshot(), "reflux_telemetry": p.RefluxTelemetry.Snapshot(), "reboiler_telemetry": p.ReboilerTelemetry.Snapshot(), "product_decisions": p.ProductAudit.Count(), "utility_used": p.UtilityLedger.Used(), "metrics": p.Metrics.Snapshot(), "campaign_changes": p.CampaignHistory.Count(), "profile_gradient": gradient, "profile_stable": p.Profile.Stable(40), "evidence_count": p.Evidence.Count(p.Campaign.Snapshot().Revision.String()), "relief_attempts": p.ReliefHistory.Count(), "open_incidents": p.Incidents.CountOpen(), "operational_audit": p.OperationalAudit()}
 }
 
 func (p *Plant) record(kind, payload string) error {
